@@ -1,0 +1,17 @@
+{
+    'SHAPE':[28,28,1],
+    'SHAPE_':[784],
+    'BATCH':100,
+    'LR':1e-3,
+    'MAXEPOCH':100,
+    'EARLYSTOP':10,
+    'NSTACKED':5,
+    'NLAYERS':2,
+    'LAYER_SIZE':[32,64],
+    'LAYER_SIZE_':[2048,1024],
+    'KERNEL':3,
+    'STRIDE':2,
+    'ACT':'softplus',
+    'MODEL':'MNIST_reg',
+    'REG':0.001,
+}
