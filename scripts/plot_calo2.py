@@ -34,8 +34,8 @@ NUM_LAYERS = dataset_config['NLAYERS'] #Hiddden layers per bijector
 use_conv = True
 
 stacked_convs = []
-for _ in range(STACKED_FFJORDS):
-    conv_model = BACKBONE_ODE(dataset_config['SHAPE'], 1, config=dataset_config,use_conv=use_conv)
+for istack in range(STACKED_FFJORDS):
+    conv_model = BACKBONE_ODE(dataset_config['SHAPE'], 1, config=dataset_config,use_conv=use_conv,num_stack=istack+1)
     stacked_convs.append(conv_model)
 
 #Create the model
