@@ -252,8 +252,9 @@ class FFJORD(bijector.Bijector):
       dtype=tf.float32,
       name='ffjord',
       is_training=False,
-      jacobian_factor=0,
-      kinetic_factor=0):
+      jacobian_factor=0,      
+      kinetic_factor=0,
+      b=0):
     """Constructs a FFJORD bijector.
     Args:
       state_time_derivative_fn: Python `callable` taking arguments `time`
@@ -302,6 +303,7 @@ class FFJORD(bijector.Bijector):
     with tf.name_scope(name) as name:
       self._initial_time = initial_time
       self._final_time = final_time
+      self._b = b #time regularizer
       self._ode_solve_fn = ode_solve_fn
       if self._ode_solve_fn is None:
         self._ode_solver = tfp_math.ode.DormandPrince()
@@ -337,11 +339,12 @@ class FFJORD(bijector.Bijector):
       final_state: `Tensor` of the same shape and dtype as `state` representing
         the solution of ODE defined by `ode_fn` at `self._final_time`.
     """
+    time_reg = tf.random.uniform(shape = [1],minval=self._final_time-self._b,maxval=self._final_time-self._b)
     integration_result = self._ode_solve_fn(
         ode_fn=ode_fn,
         initial_time=self._initial_time,
         initial_state=state,
-        solution_times=[self._final_time],
+        solution_times=time_reg,
         **kwargs)
     final_state = tf.nest.map_structure(
         lambda x: x[-1], integration_result.states)

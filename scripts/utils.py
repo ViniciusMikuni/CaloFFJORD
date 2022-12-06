@@ -66,7 +66,7 @@ def PlotRoutine(feed_dict,xlabel='',ylabel='',reference_name='Geant4'):
         else:
             ax0.plot(np.mean(feed_dict[plot],0),label=plot,linestyle=line_style[plot],color=colors[plot])
         if reference_name!=plot:
-            ratio = 100*np.divide(np.mean(feed_dict[reference_name],0)-np.mean(feed_dict[plot],0),np.mean(feed_dict[reference_name],0))
+            ratio = 100*np.divide(-np.mean(feed_dict[reference_name],0)+np.mean(feed_dict[plot],0),np.mean(feed_dict[reference_name],0))
             #ax1.plot(ratio,color=colors[plot],marker='o',ms=10,lw=0,markerfacecolor='none',markeredgewidth=3)
             if 'steps' in plot or 'r=' in plot:
                 ax1.plot(ratio,color=colors[plot],markeredgewidth=1,marker=line_style[plot],lw=0)
@@ -82,7 +82,7 @@ def PlotRoutine(feed_dict,xlabel='',ylabel='',reference_name='Geant4'):
     plt.axhline(y=0.0, color='r', linestyle='--',linewidth=1)
     plt.axhline(y=10, color='r', linestyle='--',linewidth=1)
     plt.axhline(y=-10, color='r', linestyle='--',linewidth=1)
-    plt.ylim([-50,50])
+    plt.ylim([-200,200])
 
     return fig,ax0
 

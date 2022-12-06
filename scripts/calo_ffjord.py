@@ -5,12 +5,13 @@ from tensorflow import keras
 from tensorflow.keras import layers, Input
 import time
 import matplotlib.pyplot as plt
-from tensorflow.keras.callbacks import ReduceLROnPlateau,EarlyStopping
+from tensorflow.keras.callbacks import ReduceLROnPlateau,EarlyStopping,ModelCheckpoint
 import horovod.tensorflow.keras as hvd
-# import horovod.tensorflow as hvdtf
 import preprocessing
 import argparse
-import tensorflow_datasets as tfds
+import tensorflow.keras.backend as K
+import pickle
+# import tensorflow_addons as tfa
 
 import tensorflow_probability as tfp
 tfb = tfp.bijectors
@@ -18,9 +19,54 @@ tfd = tfp.distributions
 import fjord_regularization
 #tf.random.set_seed(1233)
 
+
+class TubeletEmbedding(layers.Layer):
+    def __init__(self, embed_dim, patch_size,is_1D=False, **kwargs):
+        super().__init__(**kwargs)
+        if is_1D:
+            self.projection = layers.Conv1D(
+                filters=embed_dim,
+                kernel_size=patch_size,
+                strides=patch_size,
+                padding="VALID",
+            )
+        else:
+            self.projection = layers.Conv3D(
+                filters=embed_dim,
+                kernel_size=patch_size,
+                strides=patch_size,
+                padding="VALID",
+            )
+        self.flatten = layers.Reshape(target_shape=(-1, embed_dim))
+
+    def call(self, videos):
+        projected_patches = self.projection(videos)
+        flattened_patches = self.flatten(projected_patches)
+        return flattened_patches
+
+    
+class PositionalEncoder(layers.Layer):
+    def __init__(self, embed_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+
+    def build(self, input_shape):
+        _, num_tokens, _ = input_shape
+        self.position_embedding = layers.Embedding(
+            input_dim=num_tokens, output_dim=self.embed_dim
+        )
+        self.positions = tf.range(start=0, limit=num_tokens, delta=1)
+
+    def call(self, encoded_tokens):
+        # Encode the positions and add it to the encoded tokens
+        encoded_positions = self.position_embedding(self.positions)
+        encoded_tokens = encoded_tokens + encoded_positions
+        return encoded_tokens
+
+
 class BACKBONE_ODE(keras.Model):
     """ODE backbone network implementation"""
-    def __init__(self, data_shape,num_cond,config,name='mlp_ode',use_conv=False,num_stack=1):
+    def __init__(self, data_shape,num_cond,config,name='mlp_ode',use_1D=False,num_stack=1):
         super(BACKBONE_ODE, self).__init__()
         if config is None:
             raise ValueError("Config file not given")
@@ -29,26 +75,18 @@ class BACKBONE_ODE(keras.Model):
         self._data_shape_flat = [np.prod(data_shape)]
         self._num_stack = num_stack
         
-
-
         self.config = config
         #config file with ML parameters to be used during training        
         self.activation = self.config['ACT']
-
+        self.use_1D=use_1D
 
         #Transformation applied to conditional inputs
         inputs_time = Input((1))
         inputs_cond = Input((self._num_cond))
-        # conditional=inputs_time
+        #conditional=inputs_time
         
         conditional = tf.concat([inputs_time,inputs_cond],-1)
-        #conditional = layers.Dense(16,activation="relu",use_bias=True)(conditional)
-           
-        if use_conv:
-            inputs,outputs = self.ConvModel(conditional)
-        else:
-            inputs,outputs = self.DenseModel(conditional)
-
+        inputs,outputs = self.ViTModel(conditional)
         self._model = keras.Model(inputs=[inputs,inputs_time,inputs_cond],outputs=outputs)
                         
 
@@ -82,6 +120,82 @@ class BACKBONE_ODE(keras.Model):
         outputs = layers.Dense(self._data_shape[0],activation=None,use_bias=True)(layer_decoded)
         return inputs, outputs
 
+    def reshape_cond(self,cond,shape):
+        time_layer = tf.reshape(cond,(-1,1,cond.shape[-1]))
+        num_patches = shape[1]
+        time_layer = tf.tile(time_layer,[1,num_patches,1])
+        return time_layer
+
+    def ViTModel(self,time_embed):
+        inputs = Input((self._data_shape_flat))
+        if self.use_1D:
+            time_layer = tf.reshape(time_embed,(-1,1,time_embed.shape[-1]))
+        else:
+            time_layer = tf.reshape(time_embed,(-1,1,1,1,time_embed.shape[-1]))
+            
+        time_layer = tf.tile(time_layer,[1]+self._data_shape)
+        transformer_layers = self.config['NLAYERS']
+        num_heads=self.config['NHEADS']
+        projection_dim = self.config['PROJECTION_SIZE']
+        mlp_dim = self.config['MLP_SIZE']
+
+        
+        inputs_reshape = tf.concat([tf.reshape(inputs,[-1]+self._data_shape),time_layer],-1)
+        #inputs_reshape = tf.reshape(inputs,[-1]+self._data_shape)+time_layer
+        patches = TubeletEmbedding(embed_dim=projection_dim,is_1D=self.use_1D,
+                                   patch_size=self.config['STRIDE'])(inputs_reshape)
+        # Encode patches.
+        encoded_patches = PositionalEncoder(embed_dim=projection_dim)(patches)
+        reshaped_time = self.reshape_cond(time_embed,tf.shape(encoded_patches))
+
+        encoded_patches = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)        
+        for _ in range(transformer_layers):
+            # Layer normalization 1.
+            # x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+            x1 =encoded_patches
+
+            # Create a multi-head attention layer.
+            attention_output = layers.MultiHeadAttention(
+                num_heads=num_heads, key_dim=projection_dim//num_heads, dropout=0.0
+            )(x1, x1)
+            # Skip connection 1.
+            x2 = layers.Add()([attention_output, encoded_patches])
+            
+            # Layer normalization 2.
+            #x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+            #x3=tf.concat([x2,reshaped_time],-1)
+            x3=x2
+            # MLP.
+            #tf.nn.gelu
+            x3 = layers.Dense(2*projection_dim,activation=self.activation)(x3)
+            x3 = layers.Dense(projection_dim,activation=self.activation)(x3)
+            #time_vit = layers.Dense(projection_dim,activation=self.activation)(reshaped_time)
+            # Skip connection 2.
+            encoded_patches = layers.Add()([x3, x2])
+
+
+        #representation = layers.Add()([encoded_patches, encoded_patches1])
+        representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        # representation = self.time_conv(representation,time_embed,
+        #                                 projection_dim//2,
+        #                                 kernel_size=3,padding='same',
+        #                                 stride=self.config['STRIDE'],transpose=True)
+        
+        # layer = layers.Conv1D(1,kernel_size=1,padding="same",
+        #                       strides=1,activation=None)(representation)
+        # outputs = layers.Flatten()(layer)
+        # return inputs, outputs
+        
+        pooling = layers.GlobalAvgPool1D()(representation)
+        representation = layers.Flatten()(representation)
+        # representation = layers.Dropout(0.1)(representation)
+        layer = self.time_dense(tf.concat([representation,pooling],-1),time_embed,mlp_dim)
+        # layer = self.time_dense(representation,time_embed,mlp_dim)
+        layer = layers.Dropout(0.1)(layer)
+        layer = self.time_dense(layer,time_embed,mlp_dim//2)
+        outputs = layers.Dense(self._data_shape_flat[0],use_bias=True)(layer)
+            
+        return inputs, outputs        
     
     def ConvModel(self,time_embed):
         inputs = Input((self._data_shape_flat))
@@ -91,8 +205,6 @@ class BACKBONE_ODE(keras.Model):
         nlayers =self.config['NLAYERS']
         conv_sizes = [self._num_stack * l for l in self.config['LAYER_SIZE']]
         skip_layers = []
-
-        
         #Encoder
 
         skip_list=self.ConvEncoder(inputs_reshape,time_embed,stride_size=stride_size,
@@ -136,14 +248,35 @@ class BACKBONE_ODE(keras.Model):
             outputs = layers.Conv2D(1,kernel_size=kernel_size,padding="same",
                                     strides=1,activation=None,use_bias=True)(layer_decoded)
         else:
-            outputs = layers.Conv3D(1,kernel_size=kernel_size,padding="same",
+            layer_decoded = layers.Conv3D(conv_sizes[-1],kernel_size=kernel_size,padding="same",
+                                    strides=1,activation=None,use_bias=True)(layer_decoded)
+            layer_decoded = self.activate(layer_decoded)
+            outputs = layers.Conv3D(1,kernel_size=1,padding="same",
                                     strides=1,activation=None,use_bias=True)(layer_decoded)
         return outputs
     
     def time_conv(self,input_layer,embed,hidden_size,stride=1,kernel_size=2,padding="same",activation=True,transpose=False):
 
+        if len(self._data_shape) == 2:
+            #Incorporate the time information to each layer used in the model
+            time_layer = tf.reshape(embed,(-1,1,embed.shape[-1]))
 
-        if len(self._data_shape) == 3:
+            time_layer = tf.tile(time_layer,(1,input_layer.shape[1],1))
+            layer = tf.concat([input_layer,time_layer],-1)
+            if transpose:            
+                layer = layers.Conv1DTranspose(hidden_size,kernel_size=kernel_size,padding=padding,
+                                               strides=stride,activation=None)(layer)
+                layer = self.activate(layer)
+                layer = layers.Conv1D(hidden_size,kernel_size=kernel_size,padding=padding,
+                                      strides=1,activation=None)(layer)
+            else:
+                layer = layers.Conv1D(hidden_size,kernel_size=kernel_size,padding=padding,
+                                      strides=stride,activation=None)(layer)
+                layer = self.activate(layer)
+                layer = layers.Conv1D(hidden_size,kernel_size=kernel_size,padding=padding,
+                                      strides=1,activation=None)(layer)
+
+        elif len(self._data_shape) == 3:
             #Incorporate the time information to each layer used in the model
             time_layer = tf.reshape(embed,(-1,1,1,embed.shape[-1]))
 
@@ -153,42 +286,36 @@ class BACKBONE_ODE(keras.Model):
                 layer = layers.Conv2DTranspose(hidden_size,kernel_size=kernel_size,padding=padding,
                                                strides=stride,activation=None)(layer)
                 layer = self.activate(layer)
-                # layer = tf.concat([self.activate(layer),time_layer],-1)
-                # layer = tf.concat([layer,time_layer],-1)
                 layer = layers.Conv2D(hidden_size,kernel_size=kernel_size,padding=padding,
                                       strides=1,activation=None)(layer)
             else:
                 layer = layers.Conv2D(hidden_size,kernel_size=kernel_size,padding=padding,
                                       strides=stride,activation=None)(layer)
                 layer = self.activate(layer)
-                # layer = tf.concat([self.activate(layer),time_layer],-1)
-                # layer = tf.concat([layer,time_layer],-1)
                 layer = layers.Conv2D(hidden_size,kernel_size=kernel_size,padding=padding,
                                       strides=1,activation=None)(layer)
 
 
         elif len(self._data_shape) == 4:
             #Incorporate the time information to each layer used in the model
-            # time_layer = layers.Dense(hidden_size,activation="relu",use_bias=True)(embed)
             time_layer = tf.reshape(embed,(-1,1,1,1,embed.shape[-1]))
-
             time_layer = tf.tile(time_layer,(1,input_layer.shape[1],input_layer.shape[2],
                                              input_layer.shape[3],1))
         
             layer = tf.concat([input_layer,time_layer],-1)
-            if transpose:            
+            if transpose:
                 layer = layers.Conv3DTranspose(hidden_size,kernel_size=kernel_size,padding=padding,
                                                strides=stride,activation=None)(layer)
                 layer = self.activate(layer)
                 layer = layers.Conv3D(hidden_size,kernel_size=kernel_size,padding=padding,
                                       strides=1,activation=None)(layer)
                 
-            else:
-                layer = layers.Conv3D(hidden_size,kernel_size=kernel_size,padding=padding,
-                                      strides=stride,activation=None)(layer)
-                layer = self.activate(layer)
+            else:                
                 layer = layers.Conv3D(hidden_size,kernel_size=kernel_size,padding=padding,
                                       strides=1,activation=None)(layer)
+                layer = self.activate(layer)
+                layer = layers.Conv3D(hidden_size,kernel_size=kernel_size,padding=padding,
+                                      strides=stride,activation=None)(layer)
 
                 
         # layer = layers.BatchNormalization()(layer)
@@ -202,9 +329,6 @@ class BACKBONE_ODE(keras.Model):
     def time_dense(self,input_layer,embed,hidden_size,activation=True):
         #Incorporate the time information to each layer used in the model
         layer = tf.concat([input_layer,embed],-1)
-        layer = layers.Dense(hidden_size,activation=None)(layer)
-        layer = self.activate(layer)
-        # layer = tf.concat([self.activate(layer),embed],-1)
         layer = layers.Dense(hidden_size,activation=None)(layer)
                 
         # layer = layers.BatchNormalization()(layer)
@@ -245,12 +369,13 @@ def make_bijector_kwargs(bijector, name_to_kwargs):
 def save_model(model,name="ffjord",checkpoint_dir = '../checkpoints'):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
-    model.save_weights('{}/{}'.format(checkpoint_dir,name,save_format='tf'))
-
-def load_model(model,name="ffjord",checkpoint_dir = '../checkpoints'):
-    model.load_weights('{}/{}'.format(checkpoint_dir,name,save_format='tf')).expect_partial()
+    model.save_weights('{}/{}'.format(checkpoint_dir,name),save_format='tf')
+    np.save('optimizer.npy', model.optimizer.get_weights())
     
-        
+def load_model(model,name="ffjord",checkpoint_dir = '../checkpoints'):
+    model.load_weights('{}/{}'.format(checkpoint_dir,name)).expect_partial()
+    
+            
 class FFJORD(keras.Model):
     def __init__(self, stacked_layers,num_output,config,trace_type='hutchinson',is_training=True,name='FFJORD'):
         super(FFJORD, self).__init__()
@@ -259,12 +384,8 @@ class FFJORD(keras.Model):
             raise ValueError("Config file not given")
 
         self.config = config
-
         
-        ode_solve_fn = tfp.math.ode.DormandPrince().solve
-        
-        
-        # ode_solve_fn = tfp.math.ode.BDF().solve
+        ode_solve_fn = tfp.math.ode.DormandPrince(atol=1e-5).solve
         #Gaussian noise to trace solver
         if trace_type=='hutchinson':
             if is_training:
@@ -288,8 +409,9 @@ class FFJORD(keras.Model):
                     is_training=is_training,
                     trace_augmentation_fn=trace_augmentation_fn,
                     name='bijector{}'.format(ilayer), #Bijectors need to be named to receive conditional inputs
-                    jacobian_factor = self.config['REG'], #Regularization strength
-                    kinetic_factor = self.config['REG']
+                    jacobian_factor = self.config['JAC'], #Regularization strength
+                    kinetic_factor = self.config['REG'],
+                    b = self.config['b'],
                 )
             else:
                 
@@ -345,24 +467,57 @@ class FFJORD(keras.Model):
         )
         
         return prob
-    
-    
+
+
+
+    def discrepancy_slice_wasserstein(self,p1, p2):
+        s = tf.shape(p1)
+        if s[1] > 1:
+            # For data more than one-dimensional, perform multiple random projection to 1-D
+            proj = tf.random.normal([s[1], 128])
+            proj *= tf.math.rsqrt(tf.reduce_sum(tf.math.square(proj), 0, keepdims=True))
+            p1 = tf.matmul(p1, proj)
+            p2 = tf.matmul(p2, proj)
+
+
+        def sort_rows(matrix, num_rows):
+            matrix_T = tf.transpose(matrix, [1, 0])
+            sorted_matrix_T,_ = tf.math.top_k(matrix_T, num_rows)
+            return tf.transpose(sorted_matrix_T, [1, 0])
+
+        p1 = sort_rows(p1, s[0])
+        p2 = sort_rows(p2, s[0])
+        wdist = tf.reduce_mean(tf.square(p1 - p2))
+        return tf.reduce_mean(wdist)
+
+
     @tf.function()
     def train_step(self, inputs):
 
         data,cond = inputs
         with tf.GradientTape() as tape:
             loss = self.log_loss(data,cond)
+            sample = self.flow.sample(
+                tf.shape(data)[0],
+                bijector_kwargs=make_bijector_kwargs(
+                    self.flow.bijector, {'bijector.': {'conditional': cond}})
+        )
 
-        # tape = hvdtf.DistributedGradientTape(tape)
+            gen_energies = sample[:,504:]
+            data_energies = data[:,504:]
+
+            loss_energy=self.discrepancy_slice_wasserstein(gen_energies,data_energies)
+
+            loss = loss + 100*loss_energy
+            #+10*loss_energy
+
         g = tape.gradient(loss, self.trainable_variables)
-        # g = [tf.clip_by_norm(grad, 1) #clip large gradients
-        #      for grad in g]
 
         self.optimizer.apply_gradients(zip(g, self.trainable_variables))
+
         self.loss_tracker.update_state(loss)
 
-        return {"loss": self.loss_tracker.result()}
+        return {"loss": self.loss_tracker.result(),'swd':loss_energy}
     
     @tf.function
     def test_step(self, inputs):
@@ -387,8 +542,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--data_folder', default='/global/cfs/cdirs/m3929/SCRATCH/FCC/dataset_2_2_small.hdf5', help='Path to calorimeter dataset used during training')
-    parser.add_argument('--model', default='mnist', help='Name of the model to train. Options are: mnist, moon, calorimeter')
+
+    parser.add_argument('--model', default='calogan', help='Name of the model to train. Options are: mnist, challenge, calogan')
     parser.add_argument('--nevts', default=-1, help='Name of the model to train. Options are: mnist, moon, calorimeter')
     parser.add_argument('--load', action='store_true', default=False,help='Load pretrained weights to continue the training')
     flags = parser.parse_args()
@@ -402,17 +557,17 @@ if __name__ == '__main__':
         ntrain,samples_train =preprocessing.MNIST_prep(X_train, y_train)
         ntest,samples_test =preprocessing.MNIST_prep(X_test, y_test)
         
-        use_conv = True #Use convolutional networks for the model backbone
+        use_1D = False #Use convolutional networks for the model backbone
     elif model_name == 'calogan':        
-        dataset_config = preprocessing.LoadJson('config_calogan.json')
-        file_path=flags.data_folder
-        ntrain,ntest,samples_train,samples_test = preprocessing.CaloGAN_prep(file_path)
-        use_conv = False
+        dataset_config = preprocessing.LoadJson('config_calogan_vit.json')
+        file_path=dataset_config['FILE']
+        ntrain,ntest,samples_train,samples_test = preprocessing.CaloGAN_prep(file_path,int(flags.nevts),use_logit=True)
+        use_1D = True
     elif model_name == 'calochallenge':
-        dataset_config = preprocessing.LoadJson('config_dataset2.json')
-        file_path=flags.data_folder
-        ntrain,ntest,samples_train,samples_test = preprocessing.CaloFFJORD_prep(file_path,int(flags.nevts))
-        use_conv = True
+        dataset_config = preprocessing.LoadJson('config_challenge_vit.json')
+        file_path=dataset_config['FILE']
+        ntrain,ntest,samples_train,samples_test = preprocessing.CaloChallenge_prep(file_path,int(flags.nevts))
+        use_1D = False
     else:
         raise ValueError("Model not implemented!")
         
@@ -428,31 +583,36 @@ if __name__ == '__main__':
     #Stack of bijectors 
     stacked_convs = []
     for istack in range(STACKED_FFJORDS):
-        conv_model = BACKBONE_ODE(dataset_config['SHAPE'], 1, config=dataset_config,use_conv=use_conv,num_stack=istack+1)
+        conv_model = BACKBONE_ODE(dataset_config['SHAPE'], 1, config=dataset_config,use_1D=use_1D,num_stack=1)
         stacked_convs.append(conv_model)
 
     #Create the model
     model = FFJORD(stacked_convs,np.prod(list(dataset_config['SHAPE'])), config=dataset_config)
 
-    opt = tf.optimizers.Adam(LR)
+    opt = tf.optimizers.Adam(learning_rate=LR)
 
-    # Horovod: add Horovod DistributedOptimizer.
-    opt = hvd.DistributedOptimizer(
-        opt, backward_passes_per_step=1, average_aggregated_gradients=True)
     
-    model.compile(optimizer=opt,experimental_run_tf_function=False)
-
     if flags.load:
         load_model(model,checkpoint_dir='../checkpoint_{}'.format(dataset_config['MODEL']))
-
-
+        # old_weights = np.load('optimizer.npy', allow_pickle=True)
+        
+    opt = hvd.DistributedOptimizer(opt)
+    # Horovod: add Horovod DistributedOptimizer.
+    model.compile(optimizer=opt,experimental_run_tf_function=False)
+    
     callbacks = [
         hvd.callbacks.BroadcastGlobalVariablesCallback(0),
         hvd.callbacks.MetricAverageCallback(),
-        ReduceLROnPlateau(patience=3, min_lr=1e-7,verbose=hvd.rank() == 0),
+        ReduceLROnPlateau(patience=10, min_lr=1e-7,verbose=hvd.rank() == 0),
         EarlyStopping(patience=dataset_config['EARLYSTOP'],restore_best_weights=True),
     ]
 
+    if hvd.rank()==0:
+        checkpoint = ModelCheckpoint('../checkpoint_{}/ffjord'.format(dataset_config['MODEL']),save_best_only=True,mode='auto',
+                                                               period=1,save_weights_only=True)
+        callbacks.append(checkpoint)
+        model(np.zeros((1,dataset_config['SHAPE'][0])),np.zeros((1,1)))
+        print(model.summary())
     
     history = model.fit(
         samples_train.batch(BATCH_SIZE),
