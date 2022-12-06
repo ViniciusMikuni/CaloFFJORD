@@ -28,7 +28,7 @@ class TubeletEmbedding(layers.Layer):
         if is_1D:
             self.projection = layers.Conv1D(
                 filters=embed_dim,
-                kernel_size=[5,3,3],
+                kernel_size=patch_size,
                 strides=patch_size,
                 padding="VALID",
                 use_bias=False,
